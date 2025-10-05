@@ -3,6 +3,7 @@ use fitparser::de::{from_reader_with_options, DecodeOption};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashSet};
 use std::error::Error;
+use std::ffi::OsString;
 use std::fs::File;
 use std::io;
 use std::io::prelude::*;
@@ -28,6 +29,14 @@ struct Cli {
     /// Drop fields and messages that aren't defined in the profile
     #[structopt(long)]
     drop_unknown: bool,
+
+    /// Write all decoded output to STDOUT instead of a file
+    #[structopt(long, conflicts_with = "output")]
+    stdout: bool,
+
+    /// Override the name of the output file when writing alongside the source file or to a directory
+    #[structopt(long, parse(from_os_str))]
+    output_name: Option<PathBuf>,
 
     /// Return all enum values with their numeric value instead of the string variant name
     #[structopt(long)]
@@ -89,17 +98,42 @@ impl OutputLocation {
         &self,
         filename: &Path,
         data: Vec<fitparser::FitDataRecord>,
+        override_name: Option<&Path>,
     ) -> Result<(), Box<dyn Error>> {
         // convert data to a name: {value, units} map before serializing
         let data: Vec<FitDataMap> = data.into_iter().map(FitDataMap::new).collect();
         let json = serde_json::to_string(&data)?;
 
+        let resolve_override = |path: &Path| -> PathBuf {
+            if path.extension().is_some() {
+                PathBuf::from(path)
+            } else {
+                let mut with_ext = PathBuf::from(path);
+                with_ext.set_extension("json");
+                with_ext
+            }
+        };
+
         let outname = match self {
-            Self::Inplace => filename.with_extension("json"),
-            Self::LocalDirectory(dest) => dest
-                .clone()
-                .join(filename.file_name().unwrap())
-                .with_extension("json"),
+            Self::Inplace => {
+                if let Some(name) = override_name.and_then(|p| p.file_name()) {
+                    let mut base = filename.to_path_buf();
+                    let override_path = PathBuf::from(name);
+                    base.set_file_name(resolve_override(override_path.as_path()));
+                    base
+                } else {
+                    filename.with_extension("json")
+                }
+            }
+            Self::LocalDirectory(dest) => {
+                let name = override_name
+                    .and_then(|p| p.file_name().map(|f| f.to_os_string()))
+                    .or_else(|| filename.file_name().map(|f| f.to_os_string()))
+                    .unwrap_or_else(|| OsString::from("output"));
+                let override_buf: PathBuf = name.into();
+                let resolved = resolve_override(override_buf.as_path());
+                dest.clone().join(resolved)
+            }
             Self::LocalFile(dest) => dest.clone(),
             Self::Stdout => {
                 println!("{}", json);
@@ -116,6 +150,10 @@ impl OutputLocation {
 
 fn run() -> Result<(), Box<dyn Error>> {
     let opt = Cli::from_args();
+
+    if opt.stdout && opt.output_name.is_some() {
+        return Err("--output-name cannot be used together with --stdout".into());
+    }
 
     // set any decode options
     let mut decode_opts = HashSet::new();
@@ -138,36 +176,49 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
 
     // define parsed and serialized data output location
-    let output_loc = opt
-        .output
-        .map_or(OutputLocation::Inplace, OutputLocation::new);
+    let output_loc = if opt.stdout {
+        OutputLocation::Stdout
+    } else if let Some(output) = &opt.output {
+        OutputLocation::new(output.clone())
+    } else {
+        OutputLocation::Inplace
+    };
+
+    if opt.output_name.is_some() && matches!(output_loc, OutputLocation::LocalFile(_)) {
+        return Err("--output-name cannot be used with a single combined output file".into());
+    }
+
     let collect_all = matches!(output_loc, OutputLocation::LocalFile(_));
+
+    if opt.output_name.is_some() && opt.files.len() > 1 && !collect_all {
+        return Err("--output-name supports only a single input file".into());
+    }
 
     // read from STDIN if no files were given
     if opt.files.is_empty() {
         let mut stdin = io::stdin();
         let data = from_reader_with_options(&mut stdin, &decode_opts)?;
-        output_loc.write_json_file(&PathBuf::from("<stdin>"), data)?;
+        output_loc.write_json_file(&PathBuf::from("<stdin>"), data, opt.output_name.as_deref())?;
         return Ok(());
     }
 
     // Read each FIT file and output it
     let mut all_fit_data: Vec<fitparser::FitDataRecord> = Vec::new();
-    for file in opt.files {
+    for file in &opt.files {
         // open file and parse data
-        let mut fp = File::open(&file)?;
+        let mut fp = File::open(file)?;
         let mut data = from_reader_with_options(&mut fp, &decode_opts)?;
 
         // output a single fit file's data into a single output file
         if collect_all {
             all_fit_data.append(&mut data);
         } else {
-            output_loc.write_json_file(&file, data)?;
+            output_loc.write_json_file(file, data, opt.output_name.as_deref())?;
         }
     }
     // output fit data from all files into a single file
     if collect_all {
-        output_loc.write_json_file(&PathBuf::new(), all_fit_data)?;
+        output_loc.write_json_file(&PathBuf::new(), all_fit_data, None)?;
     }
 
     Ok(())
